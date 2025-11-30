@@ -117,13 +117,59 @@ def detect_edges(video, save_path=None):
     
 
 
+def detect_edges2(video, save_path=None):
+    analysis_vid = cv.VideoCapture(video)
+    
+    running = True
+    image_to_show = 0
+    frame_count = 0
+    success = 1
+    video_length = int(analysis_vid.get(cv.CAP_PROP_FRAME_COUNT))
+    
+    while running and success:
+        frame_count += 1
+        success, frame = analysis_vid.read()
+        
+        if success:
+            # gray = cv.cvtColor(frame, cv.COLOR_RGB2GRAY)
+            # grad_sharp = cv.GaussianBlur(gray, (5,5), 0)   # smoother background
+            # grad_sharp = cv.addWeighted(gray, 1.5, grad_sharp, -0.5, 0)  # sharpen edges
+            edges = cv.Canny(frame, 130, 200)
+            
+            
+            contours, _ = cv.findContours(edges, cv.RETR_TREE, cv.CHAIN_APPROX_SIMPLE)
 
+            edges = cv.cvtColor(edges, cv.COLOR_GRAY2BGR)
+            cv.drawContours(edges, contours, -1, (0,0,255), 2)  # sort the detected contours to make out the square!!!
+            
+            cv.imshow('frame', edges)
+            
+            # if save_path is not None:
+            #     cv.imwrite(f"{save_path}/frame_{frame_count*SKIP_FRMS:05d}.png", shown_img)
+            
+            if SKIP_FRMS * frame_count >= video_length: break
+            
+            for _ in range(SKIP_FRMS): analysis_vid.read()
+            
+            keyp = cv.waitKey(1)
+            #cam.control(keyp)
+            running = keyp != 113  # Press q to exit
+            if keyp == 105: # Press i to change the displayed image
+                image_to_show = (image_to_show+1)%3
+            
+        
+    cv.destroyAllWindows()
+    analysis_vid.release()
+    
+    return 000
+            
 
 def main():
     # detect_edges("./data/static/coin.MOV", "./data/static/sobel_imgs")
     # detect_edges("./data/moving/coin_shifted.MOV", "./data/moving/sobel_imgs")
+    detect_edges2("./data/static/coin.MOV")
     #detect_edges("./data/static/coin.MOV")
-    detect_edges("./data/moving/coin_shifted.MOV")
+    #detect_edges2("./data/moving/coin_shifted.MOV")
     
 
 if __name__ == "__main__":
