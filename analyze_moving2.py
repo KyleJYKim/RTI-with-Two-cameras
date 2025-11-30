@@ -2,6 +2,7 @@
 """
 1) Loads calib.yaml (K, dist).
 2) Undistorts the moving-light video.
+
 3) Detects the same square-with-dot marker; orders corners consistently.
 4) Estimates homography H (marker plane -> image).
 5) Decomposes H to pose (R,t) using K; builds unit light dir as -t/||t|| in marker frame.

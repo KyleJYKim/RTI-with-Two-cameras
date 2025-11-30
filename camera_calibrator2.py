@@ -48,7 +48,7 @@ def calibrate(video):
             
             if SKIP_FRMS * frame_count >= video_length: break
             
-            cal_vid.set(cv.CAP_PROP_POS_FRAMES, SKIP_FRMS)
+            for _ in range(SKIP_FRMS): cal_vid.read()
         
     cv.destroyAllWindows()
     cal_vid.release()
