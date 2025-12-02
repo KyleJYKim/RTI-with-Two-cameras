@@ -132,17 +132,54 @@ def detect_edges2(video, save_path=None):
         
         if success:
             # gray = cv.cvtColor(frame, cv.COLOR_RGB2GRAY)
-            # grad_sharp = cv.GaussianBlur(gray, (5,5), 0)   # smoother background
+            # frame = cv.GaussianBlur(gray, (1,1), 0)   # smoother background
             # grad_sharp = cv.addWeighted(gray, 1.5, grad_sharp, -0.5, 0)  # sharpen edges
             edges = cv.Canny(frame, 130, 200)
+            #edges = cv.morphologyEx(edges, cv.MORPH_OPEN, np.ones((1,1), np.uint8))
             
+            #dilate a bit to close gaps
+            edges = cv.dilate(edges, np.ones((3,3), np.uint8), iterations=1)
             
             contours, _ = cv.findContours(edges, cv.RETR_TREE, cv.CHAIN_APPROX_SIMPLE)
+            #print(contours)
 
-            edges = cv.cvtColor(edges, cv.COLOR_GRAY2BGR)
-            cv.drawContours(edges, contours, -1, (0,0,255), 2)  # sort the detected contours to make out the square!!!
             
-            cv.imshow('frame', edges)
+            # sort by area (desc) and look for a good quad
+            height, width = frame.shape[:2]
+            img_area = height * width
+            for contour in sorted(contours, key=cv.contourArea, reverse=True):
+                area = cv.contourArea(contour)
+                if area < img_area * 0.05: break   # too small to be a board
+                
+                peri = cv.arcLength(contour, True)
+                approx = cv.approxPolyDP(contour, 0.02 * peri, True)    # count edges
+                if len(approx) == 4 and cv.isContourConvex(approx):
+                    print(f"area:{area}") # test size
+                    pts = approx.reshape(-1, 2).astype(np.float32)
+                    
+                    # consistent order: [tl, tr, br, bl]
+                    pts = np.array(pts, dtype=np.float32)
+                    s = pts.sum(axis=1)
+                    d = np.diff(pts, axis = 1).ravel()
+                    tl = pts[np.argmin(s)]
+                    br = pts[np.argmax(s)]
+                    tr = pts[np.argmin(d)]
+                    bl = pts[np.argmax(d)]
+                    quad = np.array([tl, tr, br, bl], dtype=np.float32)
+                    #print(f"quad:{quad}")
+            
+            
+            
+            q = pts.astype(int)
+            cv.polylines(frame, [q], True, (0, 255, 0), 2)
+            
+            edges = cv.cvtColor(edges, cv.COLOR_GRAY2BGR)
+            #cv.drawContours(frame, contours, -1, (0,0,255), 2)  # sort the detected contours to make out the square!!!
+            
+            
+            #cv.drawContours()
+            cv.imshow('frame', frame)
+            
             
             # if save_path is not None:
             #     cv.imwrite(f"{save_path}/frame_{frame_count*SKIP_FRMS:05d}.png", shown_img)
