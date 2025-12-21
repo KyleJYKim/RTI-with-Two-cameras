@@ -72,10 +72,14 @@ def main():
     print("Static Camera:")
     ret, K, dist, rvecs, tvecs = calibrate("./data/static/calibration.MOV")
     show_and_save(ret, K, dist, rvecs, tvecs, "./calib/static/intrinsics.json")
+    # ret, K, dist, rvecs, tvecs = calibrate("./data_G/cam1/calibration.mov")
+    # show_and_save(ret, K, dist, rvecs, tvecs, "./data_G/cam1/intrinsics.json")
     
     print("Moving Camera:")
-    ret, K, dist, rvecs, tvecs = calibrate("./data/moving/calibration.MOV")
-    show_and_save(ret, K, dist, rvecs, tvecs, "./calib/moving/intrinsics.json")
+    # ret, K, dist, rvecs, tvecs = calibrate("./data/moving/calibration.MOV")
+    # show_and_save(ret, K, dist, rvecs, tvecs, "./calib/moving/intrinsics.json")
+    ret, K, dist, rvecs, tvecs = calibrate("./data_G/cam2/calibration.mp4")
+    show_and_save(ret, K, dist, rvecs, tvecs, "./data_G/cam2/intrinsics.json")
     
     print("End Camera Calibration")
 

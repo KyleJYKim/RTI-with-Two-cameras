@@ -44,11 +44,17 @@ def shift_and_save_moving_video(org_video, shfd_video, delay_sec):
 def main():
     print("Start Video Synchronization")
     
-    extract_audio("./data/static/coin.MOV", "./data/static/coin_audio.wav")  # static video = reference video
-    extract_audio("./data/moving/coin.MOV", "./data/moving/coin_audio.wav")  # moving video = to be shifted
+    # extract_audio("./data/static/coin.MOV", "./data/static/coin_audio.wav")  # static video = reference video
+    # extract_audio("./data/moving/coin.MOV", "./data/moving/coin_audio.wav")  # moving video = to be shifted
 
-    delay = compute_delay("./data/static/coin_audio.wav", "./data/moving/coin_audio.wav")
-    shift_and_save_moving_video("./data/moving/coin.MOV", "./data/moving/coin_shifted.MOV", delay)
+    # delay = compute_delay("./data/static/coin_audio.wav", "./data/moving/coin_audio.wav")
+    # shift_and_save_moving_video("./data/moving/coin.MOV", "./data/moving/coin_shifted.MOV", delay)
+    
+    extract_audio("./data_G/cam1/coin1.mov", "./data_G/cam1/coin1_audio.wav")  # static video = reference video
+    extract_audio("./data_G/cam2/coin1.mp4", "./data_G/cam2/coin1_audio.wav")  # moving video = to be shifted
+
+    delay = compute_delay("./data_G/cam1/coin1_audio.wav", "./data_G/cam2/coin1_audio.wav")
+    shift_and_save_moving_video("./data_G/cam2/coin1.mp4", "./data_G/cam2/coin1_shifted.mov", delay)
     
     print("End Video Synchronization")
     
