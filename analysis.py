@@ -26,9 +26,11 @@ def load_calibration_data(path):
         return None, None
     return K, dist
 
-def detect_edges(gray):
-    #gray = cv.adaptiveThreshold(gray, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, 11, 2)
-    #_, gray = cv.threshold(gray, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU)
+def detect_outer_square(frame):
+    gray = cv.cvtColor(frame.copy(), cv.COLOR_BGR2GRAY)
+    gray = cv.GaussianBlur(gray, (5,5), 0) # smoother background
+    gray = cv.adaptiveThreshold(gray, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, 11, 2)
+    #_, gray = cv.threshold(gray.copy(), 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU)
     #gray = cv.addWeighted(gray, 0.5, gray, 0.5, 0) # sharpen edges
     edges = cv.Canny(gray, 50, 150)
     #edges = cv.morphologyEx(edges, cv.MORPH_OPEN, np.ones((1,1), np.uint8))
@@ -70,20 +72,76 @@ def detect_edges(gray):
         
         if H_mat is None: break
         
-        warped = cv.warpPerspective(gray, H_mat, (H_SIZE, H_SIZE))
+        warped = cv.warpPerspective(frame, H_mat, (H_SIZE, H_SIZE))
         
         return quad, warped, H_mat, contours
 
     return None, None, None, contours
 
-def detect_fiducial(outer_warped, inner_quad):
+
+def detect_inner_square(frame):
+    gray = cv.cvtColor(frame.copy(), cv.COLOR_BGR2GRAY)
+    gray = cv.GaussianBlur(gray, (5,5), 0) # smoother background
+    #gray = cv.adaptiveThreshold(gray, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, 11, 2)
+    _, gray = cv.threshold(gray, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU)
+    #gray = cv.addWeighted(gray, 0.5, gray, 0.5, 0) # sharpen edges
+    edges = cv.Canny(gray, 50, 150)
+    #edges = cv.morphologyEx(edges, cv.MORPH_OPEN, np.ones((1,1), np.uint8))
+
+    # dilate a bit to close gaps
+    edges = cv.dilate(edges, np.ones((3,3), np.uint8), iterations=1)
+    
+    contours, _ = cv.findContours(edges, cv.RETR_TREE, cv.CHAIN_APPROX_SIMPLE)
+    
+    height, width = gray.shape[:2]
+    img_area = height * width
+    quad = None
+    for contour in sorted(contours, key=cv.contourArea, reverse=True):
+        area = cv.contourArea(contour)
+        if area < 0.05 * img_area: break    # too small to be a board
+
+        # Find the inner square
+        peri = cv.arcLength(contour, True)
+        approx = cv.approxPolyDP(contour, 0.02 * peri, True) # count edges
+        if len(approx) == 4 and cv.isContourConvex(approx):
+            pts = approx.reshape(-1, 2).astype(np.float32)
+
+            # consistent order: [tl, tr, br, bl]
+            s = pts.sum(axis=1)
+            d = np.diff(pts, axis=1).ravel()
+            tl = pts[np.argmin(s)]
+            br = pts[np.argmax(s)]
+            tr = pts[np.argmin(d)]
+            bl = pts[np.argmax(d)]
+            quad = np.array([tl, tr, br, bl], dtype=np.float32)
+        
+        if quad is None or quad.shape != (4, 2): break
+        
+        # Homography
+        dst_pts = np.array([[0,0], [H_SIZE,0], [H_SIZE,H_SIZE], [0,H_SIZE]]) 
+        
+        # Find teh projective transform that maps the detected square in the image to a perfectly aligned square of the size.
+        H_mat, _ = cv.findHomography(quad, dst_pts)
+        
+        if H_mat is None: break
+        
+        warped = cv.warpPerspective(frame, H_mat, (H_SIZE, H_SIZE))
+        
+        return quad, warped, H_mat, contours
+
+    return None, None, None, contours
+
+def detect_fiducial(frame, inner_quad):
     # Masking inner square to find the fiducial mark
-    mask = np.full_like(outer_warped, 255, dtype=np.uint8)  # starting with the full white is more effective
+    gray = cv.cvtColor(frame.copy(), cv.COLOR_BGR2GRAY)
+    gray = cv.GaussianBlur(gray, (9,9), 0) # smoother background
+    _, gray = cv.threshold(gray, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU)
+    mask = np.full_like(gray, 255, dtype=np.uint8)  # starting with the full white is more effective
     # fill entire outer square
     #cv.fillConvexPoly(mask, outer_quad.astype(np.int32), 255)
     # remove inner square
     cv.fillConvexPoly(mask, inner_quad.astype(np.int32), 0)
-    masked = cv.bitwise_and(outer_warped, outer_warped, mask=mask)
+    masked = cv.bitwise_and(gray, gray, mask=mask)
     masked = cv.GaussianBlur(masked, (9,9), 1.5)
     masked = cv.bitwise_not(masked)
     
@@ -143,17 +201,96 @@ def synthesize_K(W, H, fov_deg=60.0):
 def main():
     
     save_path = None # "./data/static/sobel_imgs"
-    analysis_vid1 = cv.VideoCapture("./data_G/cam1/coin1.mov")
+    analysis_vid1 = cv.VideoCapture("./data_G/cam1/coin1_synced.mov")
     K1, dist1 = load_calibration_data("./data_G/cam1/intrinsics.json")
-    analysis_vid2 = cv.VideoCapture("./data_G/cam2/coin1_shifted.mov")
+    analysis_vid2 = cv.VideoCapture("./data_G/cam2/coin1_synced.mov")
     K2, dist2 = load_calibration_data("./data_G/cam2/intrinsics.json")
     
     W = int(analysis_vid1.get(cv.CAP_PROP_FRAME_WIDTH))
     H = int(analysis_vid1.get(cv.CAP_PROP_FRAME_HEIGHT))
     if K1 is None:
         K1, dist1 = synthesize_K(W, H)  # heuristic intrinsics, zero distortion
-        print("[warning] ]No calib provided/found. Using synthetic K and zero distortion.")
+        print("[warning] No calib provided/found. Using synthetic K and zero distortion.")
+    
+    outer_quad1 = None
+    inner_quad1 = None
+    fid_x1, fid_y1, fid_r1 = None, None, None
+    running = True
+    
+    # static cam detection only requires once and then all the frames share the same detections (outer, inner, fiducial)
+    while running:
+        keyp = cv.waitKey(1)
+        running = keyp != 113  # Press q to exit
+        success1, frame1 = analysis_vid1.read()
+        if not success1: break
+
+        frame1 = cv.undistort(frame1.copy(), K1, dist1)
+
+        margin = int(0.01 * H_SIZE)   # crop 1% of width due to detection of outer square!
+        roi1 = frame1[margin:-margin, margin:-margin]
         
+        roi_outer_quad1, outer_warped1, _, _ = detect_outer_square(roi1)
+        if roi_outer_quad1 is None: continue
+        outer_quad1 = roi_outer_quad1 + np.array([margin, margin], dtype=np.float32) # back to org coords
+        
+        print("Detected static outer square")
+        
+        # Visualization
+        #vis_frame1 = cv.cvtColor(frame1, cv.COLOR_GRAY2BGR)
+        vis_frame1 = frame1.copy()
+        cv.polylines(vis_frame1, [outer_quad1.astype(int)], True, (0,0,255), 2)
+        cv.imshow(f"static_frame outer", vis_frame1)
+        cv.waitKey(1)
+        
+        
+        margin = int(0.1 * H_SIZE)   # crop
+        
+        roi1 = outer_warped1[margin:-margin, margin:-margin]
+        roi_inner_quad1, roi_inner_warped1, _, _ = detect_inner_square(roi1)
+        if roi_inner_quad1 is None: continue
+        inner_quad1 = roi_inner_quad1 + np.array([margin, margin], dtype=np.float32) # back to org coords
+        
+        print("Detected inner square")
+        
+        
+        # Visualization
+        #vis_frame1 = cv.cvtColor(roi1, cv.COLOR_GRAY2BGR)
+        vis_frame1 = roi1.copy()
+        cv.polylines(vis_frame1, [roi_inner_quad1.astype(int)], True, (0,0,255), 2)
+        
+        cv.imshow(f"static_frame inner", vis_frame1)
+        cv.waitKey(1)
+        
+        
+        margin = int(0.01 * H_SIZE)   # crop
+        roi1 = outer_warped1[margin:-margin, margin:-margin]
+        roi_inner_quad1 = roi_inner_quad1[-margin:margin, -margin:margin]
+        
+        fid_x1, fid_y1, fid_r1 = detect_fiducial(roi1, roi_inner_quad1)
+        if (fid_x1 or fid_y1 or fid_r1) is None: 
+            print("NO static fiducial mark")
+            continue
+        fid_x1 += margin
+        fid_y1 += margin
+        
+        print("Detected fiducial mark")
+        
+        # Visualization
+        #vis_frame1 = cv.cvtColor(outer_warped1, cv.COLOR_GRAY2BGR)
+        vis_frame1 = outer_warped1.copy()
+        cv.polylines(vis_frame1, [inner_quad1.astype(int)], True, (0,0,255), 2)
+        cv.circle(vis_frame1, (fid_x1, fid_y1), fid_r1, (0,255,0), 2)
+        
+        cv.imshow(f"static_frame fiducial", vis_frame1)
+        cv.waitKey(1)
+        
+        if (outer_quad1 is not None and inner_quad1 is not None) and (fid_x1 is not None and fid_y1 is not None and fid_r1 is not None): break
+        
+        if save_path is not None:
+            cv.imwrite(f"{save_path}/frame_{frame_num:05d}.png", vis_frame1)
+
+        if 1 + frame_num >= video_length1: break
+    
     video_length1 = int(analysis_vid1.get(cv.CAP_PROP_FRAME_COUNT))
     video_length2 = int(analysis_vid2.get(cv.CAP_PROP_FRAME_COUNT))
     running = True
@@ -187,34 +324,28 @@ def main():
         frame1 = cv.undistort(frame1.copy(), K1, dist1)
         frame2 = cv.undistort(frame2.copy(), K2, dist2)
 
-        gray1 = cv.cvtColor(frame1, cv.COLOR_BGR2GRAY)
-        gray1 = cv.GaussianBlur(gray1, (9,9), 0) # smoother background
-        gray2 = cv.cvtColor(frame2, cv.COLOR_BGR2GRAY)
-        gray2 = cv.GaussianBlur(gray2, (5,5), 0) # smoother background
-        
-        
         
         margin = int(0.01 * H_SIZE)   # crop 1% of width due to detection of outer square!
         
-        gray_roi1 = gray1[margin:-margin, margin:-margin]
+        roi1 = frame1[margin:-margin, margin:-margin]
         
-        gray_roi2 = gray2[margin:-margin, margin:-margin]
+        roi2 = frame2[margin:-margin, margin:-margin]
         
-        outer_quad1, outer_warped1, H_outer1, _ = detect_edges(gray_roi1)
-        if outer_quad1 is None or H_outer1 is None: continue
+        outer_quad1_, outer_warped1, H_outer1, _ = detect_outer_square(roi1)
+        if outer_quad1_ is None or H_outer1 is None: continue
         
-        outer_quad2, outer_warped2, H_outer2, _ = detect_edges(gray_roi2)
+        outer_quad2, outer_warped2, H_outer2, _ = detect_outer_square(roi2)
         if outer_quad2 is None or H_outer2 is None: continue
         
         print("Detected outer square")
         
         # Visualization
-        vis_frame1 = cv.cvtColor(gray1, cv.COLOR_GRAY2BGR)
-        vis_frame1 = vis_frame1.copy()
+        #vis_frame1 = cv.cvtColor(frame1, cv.COLOR_GRAY2BGR)
+        vis_frame1 = frame1.copy()
         cv.polylines(vis_frame1, [outer_quad1.astype(int)], True, (0,0,255), 2)
         
-        vis_frame2 = cv.cvtColor(gray2, cv.COLOR_GRAY2BGR)
-        vis_frame2 = vis_frame2.copy()
+        #vis_frame2 = cv.cvtColor(frame2, cv.COLOR_GRAY2BGR)
+        vis_frame2 = frame2.copy()
         cv.polylines(vis_frame2, [outer_quad2.astype(int)], True, (0,0,255), 2)
         
         cv.imshow(f"static_frame outer", vis_frame1)
@@ -223,28 +354,28 @@ def main():
         
         
         
-        margin = int(0.12 * H_SIZE)   # crop 1.2%
+        margin = int(0.01 * H_SIZE)   # crop 1.2%
         
         roi1 = outer_warped1[margin:-margin, margin:-margin]
-        roi_inner_quad1, roi_inner_warped1, _, _ = detect_edges(roi1)
+        roi_inner_quad1, roi_inner_warped1, _, _ = detect_inner_square(roi1)
         if roi_inner_quad1 is None: continue
-        inner_quad1 = roi_inner_quad1 + np.array([margin, margin], dtype=np.float32) # back to org coords
+        #inner_quad1 = roi_inner_quad1 + np.array([margin, margin], dtype=np.float32) # back to org coords
         
         roi2 = outer_warped2[margin:-margin, margin:-margin]
-        roi_inner_quad2, _, _, _ = detect_edges(roi2)
+        roi_inner_quad2, _, _, _ = detect_inner_square(roi2)
         if roi_inner_quad2 is None: continue
         inner_quad2 = roi_inner_quad2 + np.array([margin, margin], dtype=np.float32)
         
-        print("Detected inner square")        
+        print("Detected inner square")
         
         
         # Visualization
-        vis_frame1 = cv.cvtColor(roi1, cv.COLOR_GRAY2BGR)
-        vis_frame1 = vis_frame1.copy()
+        #vis_frame1 = cv.cvtColor(roi1, cv.COLOR_GRAY2BGR)
+        vis_frame1 = roi1.copy()
         cv.polylines(vis_frame1, [roi_inner_quad1.astype(int)], True, (0,0,255), 2)
         
-        vis_frame2 = cv.cvtColor(roi2, cv.COLOR_GRAY2BGR)
-        vis_frame2 = vis_frame2.copy()
+        #vis_frame2 = cv.cvtColor(roi2, cv.COLOR_GRAY2BGR)
+        vis_frame2 = roi2.copy()
         cv.polylines(vis_frame2, [roi_inner_quad2.astype(int)], True, (0,0,255), 2)
         
         cv.imshow(f"static_frame inner", vis_frame1)
@@ -253,23 +384,34 @@ def main():
         
         
         
-        fid_x1, fid_y1, fid_r1 = detect_fiducial(outer_warped1, inner_quad1)
-        if (fid_x1 or fid_y1 or fid_r1) is None: continue
         
-        fid_x2, fid_y2, fid_r2 = detect_fiducial(outer_warped2, inner_quad2)
-        if (fid_x2 or fid_y2 or fid_r2) is None: continue
+        # roi_inner_quad1 = roi_inner_quad1[-margin:margin, -margin:margin]
+        # fid_x1, fid_y1, fid_r1 = detect_fiducial(roi1, roi_inner_quad1)
+        # if (fid_x1 or fid_y1 or fid_r1) is None: 
+        #     print("NO static fiducial mark")
+        #     continue
+        # fid_x1 += margin
+        # fid_y1 += margin
+        
+        roi_inner_quad2 = roi_inner_quad2[-margin:margin, -margin:margin]
+        fid_x2, fid_y2, fid_r2 = detect_fiducial(roi2, roi_inner_quad2)
+        if (fid_x2 or fid_y2 or fid_r2) is None: 
+            print("NO moving fiducial mark")
+            continue
+        fid_x2 += margin
+        fid_y2 += margin
   
         
         print("Detected fiducial mark")
         
         # Visualization
-        vis_frame1 = cv.cvtColor(outer_warped1, cv.COLOR_GRAY2BGR)
-        vis_frame1 = vis_frame1.copy()
+        #vis_frame1 = cv.cvtColor(outer_warped1, cv.COLOR_GRAY2BGR)
+        vis_frame1 = outer_warped1.copy()
         cv.polylines(vis_frame1, [inner_quad1.astype(int)], True, (0,0,255), 2)
         cv.circle(vis_frame1, (fid_x1, fid_y1), fid_r1, (0,255,0), 2)
         
-        vis_frame2 = cv.cvtColor(outer_warped2, cv.COLOR_GRAY2BGR)
-        vis_frame2 = vis_frame2.copy()
+        #vis_frame2 = cv.cvtColor(outer_warped2, cv.COLOR_GRAY2BGR)
+        vis_frame2 = outer_warped2.copy()
         cv.polylines(vis_frame2, [inner_quad2.astype(int)], True, (0,0,255), 2)
         cv.circle(vis_frame2, (fid_x2, fid_y2), fid_r2, (0,255,0), 2)
         
@@ -284,8 +426,11 @@ def main():
         # For saving the static camera frame
         inner_quad1_x0, inner_quad1_y0 = inner_quad1[0].astype(int)
         inner_quad1_x1, inner_quad1_y1 = inner_quad1[2].astype(int)
+    
+        gray = cv.cvtColor(outer_warped1.copy(), cv.COLOR_BGR2GRAY)
+        
         # Crop inner square from outer_warped
-        inner_img1 = outer_warped1[inner_quad1_y0:inner_quad1_y1, inner_quad1_x0:inner_quad1_x1]
+        inner_img1 = gray[inner_quad1_y0:inner_quad1_y1, inner_quad1_x0:inner_quad1_x1]
         # Resize to canonical size
         inner_img1 = cv.resize(inner_img1, (INNER_SIZE, INNER_SIZE), interpolation=cv.INTER_AREA)
         
