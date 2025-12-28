@@ -31,6 +31,7 @@ Note:
 
 import cv2 as cv
 import numpy as np
+import matplotlib.pyplot as plt
 
 def fit_ptm(images, lights):
     """
@@ -67,16 +68,31 @@ def main():
     
     images = np.load("analysis/images.npy")
     lights = np.load("analysis/lights.npy")
+    print("images.shape:", images.shape)
+    print("images.dtype:", images.dtype)
+    assert images.shape[0] == lights.shape[0]
+    assert images.ndim == 3
+    assert lights.shape[1] == 2
+    assert np.all(np.isfinite(images))
+    assert np.all(np.isfinite(lights))
+    
+    plt.scatter(lights[:,0], lights[:,1])
+    plt.gca().set_aspect("equal")
+    plt.show()
     
     coeffs = fit_ptm(images, lights)
     np.save("analysis/ptm_coeffs.npy", coeffs)
     
-    #u, v = lights[i]
-    u, v = 0, 0
-    pred = eval_ptm(coeffs, u, v)
-    #gt = images[i]
-    cv.imshow("pred", pred)
-    cv.waitKey(0)
+    i = 0
+    for l in lights:
+        u, v = l
+        #u, v = 0, 0
+        pred = eval_ptm(coeffs, u, v)
+        gt = images[i]
+        i += 1
+        cv.imshow("pred", pred)
+        cv.imshow("img", gt)
+        cv.waitKey(100)
     
     cv.destroyAllWindows()
     
