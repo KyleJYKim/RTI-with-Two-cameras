@@ -70,6 +70,7 @@ def main():
     lights = np.load("analysis/lights.npy")
     print("images.shape:", images.shape)
     print("images.dtype:", images.dtype)
+    
     assert images.shape[0] == lights.shape[0]
     assert images.ndim == 3
     assert lights.shape[1] == 2
@@ -86,7 +87,6 @@ def main():
     i = 0
     for l in lights:
         u, v = l
-        #u, v = 0, 0
         pred = eval_ptm(coeffs, u, v)
         gt = images[i]
         i += 1

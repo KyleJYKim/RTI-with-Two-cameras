@@ -2,6 +2,7 @@
 import ffmpeg
 import librosa
 import numpy as np
+import cv2 as cv
 
 def extract_audio(video_path, wav_path):
     # extract mono WAV audio at 44.1kHz using ffmpeg-python
@@ -24,35 +25,24 @@ def detect_cue_time(wav_path, sr=8000, threshold=0.2):
     idx = np.argmax(rms > threshold * np.max(rms))
     return times[idx]
 
-def trim_video(input_video, output_video, start_time):
+def trim_video(input_video, output_video, start_time, target_fps=None):
+    input = ffmpeg.input(input_video, ss=start_time)
+
+    if target_fps is not None:
+        input = input.filter("fps", fps=target_fps)
+
     (
-        ffmpeg
-        .input(input_video, ss=start_time)
+        input
         .output(output_video)
         .overwrite_output()
         .run()
     )
-    print("Moving video shifted and saved")
-    
-# def compute_delay(static_audio, moving_audio):
-#     # compute audio delay using cross-correlation.
-#     static_y, static_sr = librosa.load(static_audio, sr=8000)   # reference audio
-#     moving_y, moving_sr = librosa.load(moving_audio, sr=8000)
-    
-#     static_y = static_y[:10 * static_sr]
-#     moving_y = moving_y[:10 * moving_sr]
-    
-#     assert static_sr == moving_sr, "Sample rates must match"
-    
-#     corr = np.correlate(static_y, moving_y, mode='full')
-#     lag = np.argmax(corr) - (len(moving_y) - 1)
-#     delay_sec = lag / static_sr
-    
-#     print(f"Sync delay estimated: {delay_sec:.4f} seconds")
-    
-#     return delay_sec
 
-
+    if target_fps is None:
+        print("Video trimmed and saved")
+    else:
+        print(f"Video trimmed, resampled to {target_fps} fps, and saved")
+    
 def main():
     print("Start Video Synchronization")
     
@@ -63,14 +53,20 @@ def main():
     static_synced = "./data_G/cam1/coin1_synced.mov"
     moving_synced = "./data_G/cam2/coin1_synced.mov"
     
+    vid1 = cv.VideoCapture(static_video)
+    vid2 = cv.VideoCapture(moving_video)
+    fps1 = vid1.get(cv.CAP_PROP_FPS)
+    fps2 = vid2.get(cv.CAP_PROP_FPS)
+    print(fps1, fps2)
+    
     extract_audio(static_video, static_sound)  # static video = reference video
     extract_audio(moving_video, moving_sound)  # moving video = to be shifted
     
     t_static = detect_cue_time(static_sound)
     t_moving = detect_cue_time(moving_sound)
     
-    trim_video(static_video, static_synced, t_static)
-    trim_video(moving_video, moving_synced, t_moving)
+    trim_video(static_video, static_synced, t_static, fps1)
+    trim_video(moving_video, moving_synced, t_moving, fps1)
     
     print("End Video Synchronization")
     
