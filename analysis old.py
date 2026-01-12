@@ -26,148 +26,136 @@ def load_calibration_data(path):
         return None, None
     return K, dist
 
-def line_from_two_points(p1, p2):
-    x1, y1 = p1
-    x2, y2 = p2
-    a = y1 - y2
-    b = x2 - x1
-    c = x1*y2 - x2*y1
-    norm = np.sqrt(a*a + b*b)
-    return a/norm, b/norm, c/norm
+def detect_outer_square(frame):
+    gray = cv.cvtColor(frame.copy(), cv.COLOR_BGR2GRAY)
+    gray = cv.GaussianBlur(gray, (5,5), 0) # smoother background
+    gray = cv.adaptiveThreshold(gray, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, 11, 2)
+    #_, gray = cv.threshold(gray.copy(), 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU)
+    #gray = cv.addWeighted(gray, 0.5, gray, 0.5, 0) # sharpen edges
+    edges = cv.Canny(gray, 50, 150)
+    #edges = cv.morphologyEx(edges, cv.MORPH_OPEN, np.ones((1,1), np.uint8))
 
-def fit_line_pca(points):
-    xm, ym = points.mean(axis=0)
-    Q = points - np.array([xm, ym])
+    # dilate a bit to close gaps
+    edges = cv.dilate(edges, np.ones((3,3), np.uint8), iterations=1)
     
-    _, _, Vt = np.linalg.svd(Q)
-    # smallest singular value
-    normal = Vt[-1]
-    a, b = normal
-    c = -a*xm - b*ym
-    norm = np.sqrt(a*a + b*b)
-    return a/norm, b/norm, c/norm
+    contours, _ = cv.findContours(edges, cv.RETR_TREE, cv.CHAIN_APPROX_SIMPLE)
     
-def ransac_line(points, n_iters=500, eps=2.0, min_inliers=50):
-    best_inliers = []
-    best_model = None
-    N = len(points)
-    
-    for _ in range(n_iters):
-        # indices of random 2 points
-        i, j = np.random.choice(N, 2, replace=False)
-        model = line_from_two_points(points[i], points[j])
-        a, b, c = model
-        
-        # perpendicular distance = |a*x_i + b*y_i + c|
-        dists = np.abs(a*points[:,0] + b*points[:,1] + c)
-        inliers = points[dists < eps]
-        
-        if len(inliers) > len(best_inliers):
-            best_inliers = inliers
-            best_model = model
-        
-    if best_model is None or len(best_inliers) < min_inliers:
-        return None, None
-    # refine using PCA on inliers
-    refined_model = fit_line_pca(best_inliers)
-    return refined_model, best_inliers
-        
-def intersect_lines(l1, l2):
-    a1, b1, c1 = l1
-    a2, b2, c2 = l2
-    A = np.array([[a1, b1], [a2, b2]])
-    C = np.array([-c1, -c2])
-    return np.linalg.solve(A, C)
-
-def detect_square(frame):
-    edges = cv.Canny(frame, 50, 150)
-
-    contours, _ = cv.findContours(edges, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_NONE)
-
-    lines = []
-    height, width = frame.shape[:2]
+    height, width = gray.shape[:2]
     img_area = height * width
-
-    for points in sorted(contours, key=cv.contourArea, reverse=True):
-        # reshape contour from (N,1,2) to (N,2)
-        points = points.reshape(-1, 2)
-        area = cv.contourArea(points)
+    quad = None
+    for contour in sorted(contours, key=cv.contourArea, reverse=True):
+        area = cv.contourArea(contour)
         if area < 0.02 * img_area: break    # too small to be a board
+
+        # Find the inner square
+        peri = cv.arcLength(contour, True)
+        approx = cv.approxPolyDP(contour, 0.05 * peri, True) # count edges
+        if len(approx) == 4 and cv.isContourConvex(approx):
+            pts = approx.reshape(-1, 2).astype(np.float32)
+
+            # consistent order: [tl, tr, br, bl]
+            s = pts.sum(axis=1)
+            d = np.diff(pts, axis=1).ravel()
+            tl = pts[np.argmin(s)]
+            br = pts[np.argmax(s)]
+            tr = pts[np.argmin(d)]
+            bl = pts[np.argmax(d)]
+            quad = np.array([tl, tr, br, bl], dtype=np.float32)
         
-        while len(points) > 50:
-                    
-            line, inliers = ransac_line(points)
-            if line is None:
-                break
-            
-            lines.append(line)
-            # points are removed once used
-            points = np.array([p for p in points if p.tolist() not in inliers.tolist()])
         
-            # theta = np.arctan2(-b, a)  # line direction
-            # lines.append((a, b, c, theta))
+    
+        # Visualization
+        # vis_frame1 = gray = cv.cvtColor(gray.copy(), cv.COLOR_GRAY2BGR)
+        # cv.polylines(vis_frame1, contours, True, (0,0,255), 2)
+        # cv.imshow(f"gray_frame outer", vis_frame1)
+        # cv.waitKey(1)
+        # if quad is None or quad.shape != (4, 2):
+        #     cv.waitKey(0)
+        # else: 
+        #     cv.waitKey(1)
+        
+        
+        if quad is None or quad.shape != (4, 2): break
+        
+        # Homography
+        dst_pts = np.array([[0,0], [H_SIZE,0], [H_SIZE,H_SIZE], [0,H_SIZE]]) 
+        
+        # Find teh projective transform that maps the detected square in the image to a perfectly aligned square of the size.
+        H_mat, _ = cv.findHomography(quad, dst_pts)
+        
+        if H_mat is None: break
+        
+        warped = cv.warpPerspective(frame, H_mat, (H_SIZE, H_SIZE))
+        
+        return quad, warped, H_mat, contours
 
-    if len(lines) < 4:
-        return None, None, None, None
-    
-    #print(f"Four LINES: {lines}")
-    # Visualization
-    #vis_frame1 = cv.cvtColor(frame_org.copy(), cv.COLOR_GRAY2BGR)
-    # vis_frame = frame.copy()
-    # cv.polylines(vis_frame, [points.astype(np.int32)], True, (0,0,255), 2)
-    # cv.imshow(f"contour", vis_frame)
-    # cv.waitKey(1)
-    
-    quad = np.ndarray([4])
-    group1 = []
-    group2 = []
+    return None, None, None, contours
 
-    a, b, _ = lines[0]
-    ref_angle =  np.arctan2(-b, a)
 
-    for line in lines:
-        a, b, _ = line
-        angle =  np.arctan2(-b, a)
-        diff = np.abs(np.sin(angle - ref_angle))  # sin handles pi ambiguity
+def detect_inner_square(frame):
+    gray = cv.cvtColor(frame.copy(), cv.COLOR_BGR2GRAY)
+    gray = cv.GaussianBlur(gray, (5,5), 0) # smoother background
+    #gray = cv.adaptiveThreshold(gray, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, 11, 2)
+    _, gray = cv.threshold(gray, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU)
+    #gray = cv.addWeighted(gray, 0.5, gray, 0.5, 0) # sharpen edges
+    edges = cv.Canny(gray, 50, 150)
+    #edges = cv.morphologyEx(edges, cv.MORPH_OPEN, np.ones((1,1), np.uint8))
 
-        if diff < 0.7:   # roughly parallel
-            group1.append(line)
-        else:
-            group2.append(line)
+    # dilate a bit to close gaps
+    edges = cv.dilate(edges, np.ones((3,3), np.uint8), iterations=1)
     
-    # sort parallel pairs
-    group1 = sorted(group1, key=lambda l: l[2])
-    group2 = sorted(group2, key=lambda l: l[2])
+    contours, _ = cv.findContours(edges, cv.RETR_TREE, cv.CHAIN_APPROX_SIMPLE)
+    
+    height, width = gray.shape[:2]
+    img_area = height * width
+    quad = None
+    for contour in sorted(contours, key=cv.contourArea, reverse=True):
+        area = cv.contourArea(contour)
+        if area < 0.05 * img_area: break    # too small to be a board
 
-    # decide which group is vertical
-    a1, b1, _ = group1[0]
-    if abs(a1) > abs(b1):
-        vertical = group1
-        horizontal = group2
-    else:
-        vertical = group2
-        horizontal = group1
-    
-    quad = np.array([
-        intersect_lines(vertical[0], horizontal[0]),
-        intersect_lines(vertical[1], horizontal[0]),
-        intersect_lines(vertical[1], horizontal[1]),
-        intersect_lines(vertical[0], horizontal[1]),
-    ])
-    
-    #if quad is None or quad.shape != (4, 2): break
-    
-    # Homography
-    dst_pts = np.array([[0,0], [H_SIZE,0], [H_SIZE,H_SIZE], [0,H_SIZE]]) 
-    
-    # Find teh projective transform that maps the detected square in the image to a perfectly aligned square of the size.
-    H_mat, _ = cv.findHomography(quad, dst_pts)
-    
-    if H_mat is None: return None, None, None, None
-    
-    warped = cv.warpPerspective(frame, H_mat, (H_SIZE, H_SIZE))
-    
-    return quad, warped, H_mat, contours
+        # Find the inner square
+        peri = cv.arcLength(contour, True)
+        approx = cv.approxPolyDP(contour, 0.02 * peri, True) # count edges
+        if len(approx) == 4 and cv.isContourConvex(approx):
+            pts = approx.reshape(-1, 2).astype(np.float32)
+
+            # consistent order: [tl, tr, br, bl]
+            s = pts.sum(axis=1)
+            d = np.diff(pts, axis=1).ravel()
+            tl = pts[np.argmin(s)]
+            br = pts[np.argmax(s)]
+            tr = pts[np.argmin(d)]
+            bl = pts[np.argmax(d)]
+            quad = np.array([tl, tr, br, bl], dtype=np.float32)
+        
+        
+        
+        # Visualization
+        # vis_frame1 = gray = cv.cvtColor(gray.copy(), cv.COLOR_GRAY2BGR)
+        # cv.polylines(vis_frame1, contours, True, (0,0,255), 2)
+        # cv.imshow(f"gray_frame inner", vis_frame1)
+        # cv.waitKey(1)
+        # if quad is None or quad.shape != (4, 2):
+        #     cv.waitKey(0)
+        # else: 
+        #     cv.waitKey(1)
+        
+        
+        if quad is None or quad.shape != (4, 2): break
+        
+        # Homography
+        dst_pts = np.array([[0,0], [H_SIZE,0], [H_SIZE,H_SIZE], [0,H_SIZE]]) 
+        
+        # Find teh projective transform that maps the detected square in the image to a perfectly aligned square of the size.
+        H_mat, _ = cv.findHomography(quad, dst_pts)
+        
+        if H_mat is None: break
+        
+        warped = cv.warpPerspective(frame, H_mat, (H_SIZE, H_SIZE))
+        
+        return quad, warped, H_mat, contours
+
+    return None, None, None, contours
 
 def detect_fiducial(frame, inner_quad):
     # Masking inner square to find the fiducial mark
@@ -250,8 +238,6 @@ def main():
         K1, dist1 = synthesize_K(W, H)  # heuristic intrinsics, zero distortion
         print("[warning] No calib provided/found. Using synthetic K and zero distortion.")
     
-    # both outer and inner square of static frames, 
-    # and inner square of moving frames are captured only once
     outer_quad1 = None
     inner_quad1 = None
     fid_x1, fid_y1, fid_r1 = None, None, None
@@ -269,7 +255,7 @@ def main():
         margin = int(0.01 * H_SIZE)   # crop 1% of width due to detection of outer square!
         roi1 = frame1[margin:-margin, margin:-margin]
         
-        roi_outer_quad1, outer_warped1, _, _ = detect_square(roi1)
+        roi_outer_quad1, outer_warped1, _, _ = detect_outer_square(roi1)
         if roi_outer_quad1 is None: continue
         outer_quad1 = roi_outer_quad1 + np.array([margin, margin], dtype=np.float32) # back to org coords
         
@@ -279,24 +265,24 @@ def main():
         # vis_frame1 = frame1.copy()
         # cv.polylines(vis_frame1, [outer_quad1.astype(int)], True, (0,0,255), 2)
         # cv.imshow(f"static_frame outer", vis_frame1)
-        # cv.waitKey(0)
+        # cv.waitKey(1)
         
         
         margin = int(0.1 * H_SIZE)   # crop
         
         roi1 = outer_warped1[margin:-margin, margin:-margin]
-        roi_inner_quad1, roi_inner_warped1, _, _ = detect_square(roi1)
+        roi_inner_quad1, roi_inner_warped1, _, _ = detect_inner_square(roi1)
         if roi_inner_quad1 is None: continue
         inner_quad1 = roi_inner_quad1 + np.array([margin, margin], dtype=np.float32) # back to org coords
         
-        print("Detected static inner square")
+        print("Detected inner square")
         
         
         # Visualization
         # vis_frame1 = roi1.copy()
         # cv.polylines(vis_frame1, [roi_inner_quad1.astype(int)], True, (0,0,255), 2)
         # cv.imshow(f"static_frame inner", vis_frame1)
-        # cv.waitKey(0)
+        # cv.waitKey(1)
         
         
         margin = int(0.01 * H_SIZE)   # crop
@@ -310,7 +296,7 @@ def main():
         fid_x1 += margin
         fid_y1 += margin
         
-        print("Detected static fiducial mark")
+        print("Detected fiducial mark")
         
         # Visualization
         # vis_frame1 = outer_warped1.copy()
@@ -358,10 +344,10 @@ def main():
         
         # of course moving cam keeps to find new one
         roi2 = frame2[margin:-margin, margin:-margin]
-        outer_quad2, outer_warped2, H_outer2, _ = detect_square(roi2)
+        outer_quad2, outer_warped2, H_outer2, _ = detect_outer_square(roi2)
         if outer_quad2 is None or H_outer2 is None: continue
         
-        print("Detected moving outer square")
+        print("Detected outer square")
         
         
         # Visualization
@@ -378,22 +364,30 @@ def main():
         
         # well.. this is only for visualization
         roi1 = outer_warped1[margin:-margin, margin:-margin]
-        roi_inner_quad1, roi_inner_warped1, _, _ = detect_square(roi1)
+        roi_inner_quad1, roi_inner_warped1, _, _ = detect_inner_square(roi1)
         if roi_inner_quad1 is None: continue
         #inner_quad1 = roi_inner_quad1 + np.array([margin, margin], dtype=np.float32) # back to org coords
         
-        #roi2 = outer_warped2[margin:-margin, margin:-margin]
-        inner_quad2 = inner_quad1
+        roi2 = outer_warped2[margin:-margin, margin:-margin]
+        roi_inner_quad2, _, _, _ = detect_inner_square(roi2)
+        if roi_inner_quad2 is None: continue
+        inner_quad2 = roi_inner_quad2 + np.array([margin, margin], dtype=np.float32)
+        
+        print("Detected inner square")
+        
         
         # Visualization
-        vis_frame2 = outer_warped2.copy()
-        cv.polylines(vis_frame2, [inner_quad2.astype(int)], True, (0,0,255), 2)
-        cv.imshow(f"moving_frame inner", vis_frame2)
-        cv.waitKey(1)
+        # vis_frame1 = roi1.copy()
+        # cv.polylines(vis_frame1, [roi_inner_quad1.astype(int)], True, (0,0,255), 2)
+        # vis_frame2 = roi2.copy()
+        # cv.polylines(vis_frame2, [roi_inner_quad2.astype(int)], True, (0,0,255), 2)
+        # cv.imshow(f"static_frame inner", vis_frame1)
+        # cv.imshow(f"moving_frame inner", vis_frame2)
+        # cv.waitKey(1)
         
-        roi2 = outer_warped2[margin:-margin, margin:-margin]
-        roi_inner_quad2 = inner_quad2[-margin:margin, -margin:margin]
-        fid_x2, fid_y2, fid_r2 = detect_fiducial(outer_warped2, inner_quad2)
+        
+        roi_inner_quad2 = roi_inner_quad2[-margin:margin, -margin:margin]
+        fid_x2, fid_y2, fid_r2 = detect_fiducial(roi2, roi_inner_quad2)
         if (fid_x2 or fid_y2 or fid_r2) is None: 
             print("NO moving fiducial mark")
             continue
@@ -403,20 +397,20 @@ def main():
         print("Detected fiducial mark")
         
         # Rotation by fiducial mark position
-        outer_warped1, fid_rot1, R_f1 = set_frame_orientation(outer_warped1, (fid_x1, fid_y1), H_SIZE)
+        outer_warped1, fid_rot1, _ = set_frame_orientation(outer_warped1, (fid_x1, fid_y1), H_SIZE)
         outer_warped2, fid_rot2, R_f2 = set_frame_orientation(outer_warped2, (fid_x2, fid_y2), H_SIZE)
         
         
         # Visualization
-        vis_frame1 = outer_warped1.copy()
-        cv.polylines(vis_frame1, [inner_quad1.astype(int)], True, (0,0,255), 2)
-        cv.circle(vis_frame1, (fid_x1, fid_y1), fid_r1, (0,255,0), 2)
-        vis_frame2 = outer_warped2.copy()
-        cv.polylines(vis_frame2, [inner_quad2.astype(int)], True, (0,0,255), 2)
-        cv.circle(vis_frame2, (fid_x2, fid_y2), fid_r2, (0,255,0), 2)
-        cv.imshow(f"static_frame fiducial", vis_frame1)
-        cv.imshow(f"moving_frame fiducial", vis_frame2)
-        cv.waitKey(1)
+        # vis_frame1 = outer_warped1.copy()
+        # cv.polylines(vis_frame1, [inner_quad1.astype(int)], True, (0,0,255), 2)
+        # cv.circle(vis_frame1, (fid_x1, fid_y1), fid_r1, (0,255,0), 2)
+        # vis_frame2 = outer_warped2.copy()
+        # cv.polylines(vis_frame2, [inner_quad2.astype(int)], True, (0,0,255), 2)
+        # cv.circle(vis_frame2, (fid_x2, fid_y2), fid_r2, (0,255,0), 2)
+        # cv.imshow(f"static_frame fiducial", vis_frame1)
+        # cv.imshow(f"moving_frame fiducial", vis_frame2)
+        # cv.waitKey(1)
         
         
         # For saving the static camera frame
