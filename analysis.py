@@ -276,7 +276,23 @@ def synthesize_K(W, H, fov_deg=60.0):
     return K, dist
 
 def main():
+    """
+    Here, appended digit 1 and 2 to variables indicate static cam and moving cam, respectively.
+    e.g., K1 and K2 mean K for static cam and K for moving cam.
     
+    The main sequence for each frame follows:
+        1. Apply calibration.
+        2. In the 1st loop, detect the outer and inner square of static cam once and for all the others.
+        3. In the 2nd loop:
+            - Get the warped image of static cam;
+            - Detect and get the outer quad and warped image of moving cam;
+            - Detect the fiducial marks of static and moving cams by masking the warped images with the inner_quad1 detected in the 1st loop
+              (the inner_quad1 applies to both warped images because they are in the same size, hence inner_quad2 = inner_quad1);
+            - Rotate the warped images according to the position of the fiducial marks and get the rotation amounts;
+            - Crop the static cam image for saving;
+            - Calculate the light direction with the rotation data;
+            - Save and repeat.
+    """
     save_path = None # "./data/static/sobel_imgs"
     analysis_vid1 = cv.VideoCapture("./data_G/cam1/coin1_synced.mov")
     K1, dist1 = load_calibration_data("./data_G/cam1/intrinsics.json")
@@ -296,7 +312,7 @@ def main():
     fid_x1, fid_y1, fid_r1 = None, None, None
     running = True
     
-    # static cam detection only requires once and then all the frames share the same detections (outer, inner, fiducial)
+    # Note: static cam detection only requires once and then all the frames share the same detections (outer, inner, fiducial)
     while running:
         keyp = cv.waitKey(1)
         running = keyp != 113  # Press q to exit
@@ -313,13 +329,11 @@ def main():
         outer_quad1 = roi_outer_quad1 + np.array([margin, margin], dtype=np.float32) # back to org coords
         
         print("Detected static outer square")
-        
         # Visualization
         # vis_frame1 = frame1.copy()
         # cv.polylines(vis_frame1, [outer_quad1.astype(int)], True, (0,0,255), 2)
         # cv.imshow(f"static_frame outer", vis_frame1)
         # cv.waitKey(0)
-        
         
         margin = int(0.1 * H_SIZE)   # crop
         
@@ -329,8 +343,6 @@ def main():
         inner_quad1 = roi_inner_quad1 + np.array([margin, margin], dtype=np.float32) # back to org coords
         
         print("Detected static inner square")
-        
-        
         # Visualization
         # vis_frame1 = roi1.copy()
         # cv.polylines(vis_frame1, [roi_inner_quad1.astype(int)], True, (0,0,255), 2)
@@ -353,7 +365,6 @@ def main():
         fid_y1 += margin
         
         print("Detected static fiducial mark")
-        
         # Visualization
         # vis_frame1 = outer_warped1.copy()
         # cv.polylines(vis_frame1, [inner_quad1.astype(int)], True, (0,0,255), 2)
@@ -371,25 +382,25 @@ def main():
     
     video_length1 = int(analysis_vid1.get(cv.CAP_PROP_FRAME_COUNT))
     video_length2 = int(analysis_vid2.get(cv.CAP_PROP_FRAME_COUNT))
-    inner_quad2 = inner_quad1
+    inner_quad2 = inner_quad1   # assuming after warp, the inner square sizes are same.
     running = True
-    frame_count = 0
+    frame_cnt = 1
     frame_num = 1
-    all_images = [] # from static cam
-    all_lights = [] # from moving cam
-    all_U = []  # for colorizing
-    all_V = []
-    mvn_sqr_fail_cnt = 0
-    mvn_fid_fail_cnt = 0
+    all_images = []         # from static cam, gray
+    all_lights = []         # from moving cam
+    all_U = []              # for colorizing
+    all_V = []              # for colorizing
+    mvn_sqr_fail_cnt = 0    # for debugging
+    mvn_fid_fail_cnt = 0    # for debugging
     
     while running:
-        keyp = cv.waitKey(1)
-        running = keyp != 113  # Press q to exit
-        frame_count += 1
         success1, frame1 = analysis_vid1.read()
         success2, frame2 = analysis_vid2.read()
         if not (success1 and success2): break
-
+        
+        print(f"FRAME NUMBER: {frame_num:05d}")
+        print(f"FRAME COUNT: {frame_cnt:05d}")
+        
         frame1 = cv.undistort(frame1.copy(), K1, dist1)
         frame2 = cv.undistort(frame2.copy(), K2, dist2)
 
@@ -402,7 +413,7 @@ def main():
         if H_outer1 is not None:
             outer_warped1 = cv.warpPerspective(frame1, H_outer1, (H_SIZE, H_SIZE))
             
-            # of course moving cam keeps to find new one
+            # moving cam search for lighting!
             roi2 = frame2[margin:-margin, margin:-margin]
             outer_quad2, outer_warped2, H_outer2, _ = detect_square(roi2)
             if outer_quad2 is None or H_outer2 is None:
@@ -411,15 +422,14 @@ def main():
                 mvn_sqr_fail_cnt += 1
             else:
                 print("Detected moving outer square")
-                
                 # Visualization
-                vis_frame1 = frame1.copy()
-                cv.polylines(vis_frame1, [outer_quad1.astype(int)], True, (0,0,255), 2)
-                vis_frame2 = frame2.copy()
-                cv.polylines(vis_frame2, [outer_quad2.astype(int)], True, (0,0,255), 2)
-                cv.imshow(f"static_frame outer", vis_frame1)
-                cv.imshow(f"moving_frame outer", vis_frame2)
-                cv.waitKey(1)
+                # vis_frame1 = frame1.copy()
+                # cv.polylines(vis_frame1, [outer_quad1.astype(int)], True, (0,0,255), 2)
+                # vis_frame2 = frame2.copy()
+                # cv.polylines(vis_frame2, [outer_quad2.astype(int)], True, (0,0,255), 2)
+                # cv.imshow(f"static_frame outer", vis_frame1)
+                # cv.imshow(f"moving_frame outer", vis_frame2)
+                # cv.waitKey(1)
                 
                 #margin = int(0.01 * H_SIZE)   # crop 1.2%
                 # well.. this is only for visualization
@@ -541,8 +551,11 @@ def main():
 
         for _ in range(SKIP_FRMS): analysis_vid1.read()
         for _ in range(SKIP_FRMS): analysis_vid2.read()
+        
         frame_num += (SKIP_FRMS + 1)
-        print(f"FRAME NUMBER {frame_num:05d}")
+        frame_cnt += 1
+        
+        if cv.waitKey(1) == 113: break
 
     print(f"MOVING SQUARE DETECTION FAIL COUNT: {mvn_sqr_fail_cnt}")
     print(f"MOVING FIDUCIAL DETECTION FAIL COUNT: {mvn_fid_fail_cnt}")
