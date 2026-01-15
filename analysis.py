@@ -5,7 +5,7 @@ import cv2 as cv
 import numpy as np
 import matplotlib.pyplot as plt
 
-SKIP_FRMS = 0
+SKIP_FRMS = 5
 SCALE = 9   # kernel size
 K = 0.04     # optimal: 0.04 – 0.15
 THRESH = 0.01
@@ -78,6 +78,20 @@ def intersect_lines(l1, l2):
     A = np.array([[a1, b1], [a2, b2]])
     C = np.array([-c1, -c2])
     return np.linalg.solve(A, C)
+
+def order_quad(quad): # tl, tr, br, bl
+    quad = np.asarray(quad, dtype=np.float32)
+    centroid = quad.mean(axis=0)
+
+    # angle around centroid
+    angles = np.arctan2(quad[:,1] - centroid[1], quad[:,0] - centroid[0])
+    quad = quad[np.argsort(angles)]
+
+    # ensure TL first: TL has minimal (x + y)
+    idx = np.argmin(quad[:,0] + quad[:,1])
+    quad = np.roll(quad, -idx, axis=0)
+
+    return quad
 
 def detect_square(frame_org, graying=True):
     frame = frame_org.copy()
@@ -163,10 +177,12 @@ def detect_square(frame_org, graying=True):
     
     #if quad is None or quad.shape != (4, 2): break
     
-    # Homography
-    dst_pts = np.array([[0,0], [H_SIZE,0], [H_SIZE,H_SIZE], [0,H_SIZE]]) 
     
-    # Find teh projective transform that maps the detected square in the image to a perfectly aligned square of the size.
+    # Homography
+    # while image quad is tr-tl-bl-br, destination points is tl-tr-br-bl, so need to be ordered.
+    quad = order_quad(quad)
+    dst_pts = np.array([[0,0], [H_SIZE,0], [H_SIZE,H_SIZE], [0,H_SIZE]]) 
+    # Find the projective transform that maps the detected square in the image to a perfectly aligned square of the size.
     H_mat, _ = cv.findHomography(quad, dst_pts)
     
     if H_mat is None: return None, None, None, None
@@ -218,18 +234,18 @@ def detect_fiducial(frame, inner_quad):
     points = np.column_stack([xs, ys])
     xc, yc, r = fit_circle_svd(points)
     
-    print(f"RADIUS SIZE: {r}")
+    # print(f"RADIUS SIZE: {r}")
     # Visualization
     # vis_frame1 = masked.copy()
     # cv.circle(vis_frame1, (int(xc), int(yc)), int(r), (0,255,0), 2)
     # cv.imshow(f"frame fiducial", vis_frame1)
     # cv.waitKey(1)
     
-    if r < 5 or r > 80: return None, None, None
+    if r < 10 or r > 20: return None, None, None    # around 15
     
     return int(xc), int(yc), int(r)
     
-def set_frame_orientation(warped, fiducial_pos, size=H_SIZE):
+def set_frame_orientation(warped, quad, fiducial_pos, size=H_SIZE):
     """
     Because the warped images are not guaranteed to face the same direction,
     this here ensures fiducial to position in top-left quadrant,
@@ -251,19 +267,13 @@ def set_frame_orientation(warped, fiducial_pos, size=H_SIZE):
         rot_k = 3   # rotate 270 CCW
 
     warped_rot = np.rot90(warped, k=rot_k)
+    quad_rot = quad.copy().astype(np.float32)
     fid_rot = np.array([x, y], dtype=np.float32)
-
-    for _ in range(rot_k):
+    for _ in range(rot_k): 
+        quad_rot = np.column_stack([quad_rot[:,1], size - quad_rot[:,0]])
         fid_rot = np.array([fid_rot[1], size - fid_rot[0]], dtype=np.float32)
-
-    theta = rot_k * (np.pi / 2.0)
-    R_f = np.array([
-        [ np.cos(theta), -np.sin(theta), 0],
-        [ np.sin(theta),  np.cos(theta), 0],
-        [ 0,              0,             1]
-    ], dtype=np.float32)
-
-    return warped_rot, fid_rot, R_f
+        
+    return warped_rot, quad_rot, fid_rot, rot_k
 
 def synthesize_K(W, H, fov_deg=60.0):
     # pinhole guess: fx = fy = 0.5*W / tan(FOV/2), cx=W/2, cy=H/2
@@ -275,24 +285,85 @@ def synthesize_K(W, H, fov_deg=60.0):
     dist = np.zeros(5, dtype=np.float64)
     return K, dist
 
-def main():
+
+def get_contours_separated(frame_gray):
     """
-    Here, appended digit 1 and 2 to variables indicate static cam and moving cam, respectively.
-    e.g., K1 and K2 mean K for static cam and K for moving cam.
+    Detects contours in the frame and returns separately:
+    - outer_points: points of the largest contour (outer square)
+    - inner_points: points of the second largest contour (inner square)
+    - fiducial_points: points inside the inner square
+    Returns None for any contour not found.
+    """
+    edges = cv.Canny(frame_gray, 50, 150)
+    contours, hierarchy = cv.findContours(edges, cv.RETR_TREE, cv.CHAIN_APPROX_NONE)
+    if len(contours) == 0:
+        return None, None, None
+
+    # sort contours by area descending
+    contours = sorted(contours, key=cv.contourArea, reverse=True)
+
+    # initialize outputs
+    outer_points = inner_points = fiducial_points = None
+
+    if len(contours) >= 1:
+        outer_points = contours[0].reshape(-1,2).astype(np.float32)
+    if len(contours) >= 2:
+        inner_points = contours[1].reshape(-1,2).astype(np.float32)
+
     
-    The main sequence for each frame follows:
-        1. Apply calibration.
-        2. In the 1st loop, detect the outer and inner square of static cam once and for all the others.
-        3. In the 2nd loop:
-            - Get the warped image of static cam;
-            - Detect and get the outer quad and warped image of moving cam;
-            - Detect the fiducial marks of static and moving cams by masking the warped images with the inner_quad1 detected in the 1st loop
-              (the inner_quad1 applies to both warped images because they are in the same size, hence inner_quad2 = inner_quad1);
-            - Rotate the warped images according to the position of the fiducial marks and get the rotation amounts;
-            - Crop the static cam image for saving;
-            - Calculate the light direction with the rotation data;
-            - Save and repeat.
-    """
+    
+        # Visualization
+        vis_frame1 = cv.cvtColor(frame_gray.copy(), cv.COLOR_GRAY2BGR)
+        cv.polylines(vis_frame1, [inner_points.astype(int)], True, (0,0,255), 2)
+        cv.polylines(vis_frame1, [outer_points.astype(int)], True, (0,0,255), 2)
+        cv.imshow(f"static frame outer", vis_frame1)
+        cv.waitKey(0)
+    
+    
+        # Create a mask for inner square
+        mask = np.zeros_like(frame_gray, dtype=np.uint8)
+        cv.fillConvexPoly(mask, inner_points.astype(np.int32), 255)
+
+        # Mask the image and detect small contours (fiducial)
+        masked_gray = cv.bitwise_and(frame_gray, frame_gray, mask=mask)
+        edges_inner = cv.Canny(masked_gray, 50, 150)
+        fid_contours, _ = cv.findContours(edges_inner, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_NONE)
+
+        # Select the largest contour inside inner square as fiducial
+        if len(fid_contours) > 0:
+            fiducial_contour = max(fid_contours, key=cv.contourArea)
+            fiducial_points = fiducial_contour.reshape(-1,2).astype(np.float32)
+
+    return outer_points, inner_points, fiducial_points
+
+def get_contours(frame_gray):
+    edges = cv.Canny(frame_gray, 50, 150)
+
+    contours, hierarchy = cv.findContours(edges, cv.RETR_TREE, cv.CHAIN_APPROX_NONE)
+    if len(contours) == 0: return None
+
+    hierarchy = hierarchy[0]  # flatten
+
+    # sort contours by area descending
+    areas = [cv.contourArea(c) for c in contours]
+    sorted_idx = np.argsort(areas)[::-1]  # largest first (likely the outer square)
+
+    all_points = []
+
+    # take top 3 contours: outer square, inner square, fiducial
+    count = 0
+    for idx in sorted_idx:
+        contour = contours[idx].reshape(-1, 2)
+        all_points.append(contour)
+        count += 1
+        if count == 5:
+            break
+
+    all_points = np.vstack(all_points)
+    return all_points
+
+
+def main():
     save_path = None # "./data/static/sobel_imgs"
     analysis_vid1 = cv.VideoCapture("./data_G/cam1/coin1_synced.mov")
     K1, dist1 = load_calibration_data("./data_G/cam1/intrinsics.json")
@@ -307,9 +378,7 @@ def main():
     
     # both outer and inner square of static frames, 
     # and inner square of moving frames are captured only once
-    outer_quad1 = None
-    inner_quad1 = None
-    fid_x1, fid_y1, fid_r1 = None, None, None
+    outer_points1, inner_points1, fiducial_points1 = None, None, None
     running = True
     
     # Note: static cam detection only requires once and then all the frames share the same detections (outer, inner, fiducial)
@@ -324,65 +393,24 @@ def main():
         margin = int(0.01 * H_SIZE)   # crop 1% of width due to detection of outer square!
         roi1 = frame1[margin:-margin, margin:-margin]
         
-        roi_outer_quad1, outer_warped1, _, _ = detect_square(roi1)
-        if roi_outer_quad1 is None: continue
-        outer_quad1 = roi_outer_quad1 + np.array([margin, margin], dtype=np.float32) # back to org coords
+        gray1 = cv.cvtColor(roi1.copy(), cv.COLOR_BGR2GRAY)
+        gray1 = cv.GaussianBlur(gray1, (5,5), 0) # smoother background
+        gray1 = cv.adaptiveThreshold(gray1, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, 11, 2)
+        outer_points1, inner_points1, fiducial_points1 = get_contours_separated(gray1)
+        if outer_points1 is None or inner_points1 is None or fiducial_points1 is None: continue
+        outer_points1 = outer_points1 + np.array([margin, margin], dtype=np.float32)
+        inner_points1 = outer_points1 + np.array([margin, margin], dtype=np.float32)
+        fiducial_points1 = outer_points1 + np.array([margin, margin], dtype=np.float32)
         
-        print("Detected static outer square")
-        # Visualization
-        # vis_frame1 = frame1.copy()
-        # cv.polylines(vis_frame1, [outer_quad1.astype(int)], True, (0,0,255), 2)
-        # cv.imshow(f"static_frame outer", vis_frame1)
-        # cv.waitKey(0)
+        running = False
         
-        margin = int(0.1 * H_SIZE)   # crop
-        
-        roi1 = outer_warped1[margin:-margin, margin:-margin]
-        roi_inner_quad1, roi_inner_warped1, _, _ = detect_square(roi1, False)
-        if roi_inner_quad1 is None: continue
-        inner_quad1 = roi_inner_quad1 + np.array([margin, margin], dtype=np.float32) # back to org coords
-        
-        print("Detected static inner square")
-        # Visualization
-        # vis_frame1 = roi1.copy()
-        # cv.polylines(vis_frame1, [roi_inner_quad1.astype(int)], True, (0,0,255), 2)
-        # cv.imshow(f"static_frame inner", vis_frame1)
-        # cv.waitKey(0)
-        
-        
-        margin = int(0.02 * H_SIZE)   # crop
-        roi1 = outer_warped1[margin:-margin, margin:-margin]
-        # inflate inner quad for inner square masking
-        center = np.mean(inner_quad1, axis=0)
-        scale = 1.07  # inflation factor 7%
-        roi_inner_quad1 = center + scale * (inner_quad1 - center)
-        
-        fid_x1, fid_y1, fid_r1 = detect_fiducial(roi1, roi_inner_quad1)
-        if (fid_x1 or fid_y1 or fid_r1) is None: 
-            print("NO static fiducial mark")
-            continue
-        fid_x1 += margin
-        fid_y1 += margin
-        
-        print("Detected static fiducial mark")
-        # Visualization
-        # vis_frame1 = outer_warped1.copy()
-        # cv.polylines(vis_frame1, [inner_quad1.astype(int)], True, (0,0,255), 2)
-        # cv.circle(vis_frame1, (fid_x1, fid_y1), fid_r1, (0,255,0), 2)
-        # cv.imshow(f"static_frame fiducial", vis_frame1)
-        # cv.waitKey(1)
-        
-        if (outer_quad1 is not None and inner_quad1 is not None) and (fid_x1 is not None and fid_y1 is not None and fid_r1 is not None): break
-        
-        if save_path is not None:
-            cv.imwrite(f"{save_path}/frame_{frame_num:05d}.png", vis_frame1)
+        # if save_path is None:
+        #     cv.imwrite(f"{save_path}/frame_{frame_num:05d}.png", vis_frame1)
 
-        if 1 + frame_num >= video_length1: break
-    
+        # if 1 + frame_num >= video_length1: break
     
     video_length1 = int(analysis_vid1.get(cv.CAP_PROP_FRAME_COUNT))
     video_length2 = int(analysis_vid2.get(cv.CAP_PROP_FRAME_COUNT))
-    inner_quad2 = inner_quad1   # assuming after warp, the inner square sizes are same.
     running = True
     frame_cnt = 1
     frame_num = 1
@@ -390,158 +418,136 @@ def main():
     all_lights = []         # from moving cam
     all_U = []              # for colorizing
     all_V = []              # for colorizing
-    mvn_sqr_fail_cnt = 0    # for debugging
-    mvn_fid_fail_cnt = 0    # for debugging
+    
+    plt.ion()  # interactive mode ON
+    fig, ax = plt.subplots()
+    sc = ax.scatter([], [])
+    ax.set_aspect('equal')
+    ax.set_xlim(-1.05, 1.05)
+    ax.set_ylim(-1.05, 1.05)
+    ax.set_title("Light directions (u, v)")
+    ax.grid(True)
     
     while running:
         success1, frame1 = analysis_vid1.read()
         success2, frame2 = analysis_vid2.read()
         if not (success1 and success2): break
         
-        print(f"FRAME NUMBER: {frame_num:05d}")
+        print(f"FRAME NUMBER: {frame_num:05d}/{video_length1:05d}")
         print(f"FRAME COUNT: {frame_cnt:05d}")
         
         frame1 = cv.undistort(frame1.copy(), K1, dist1)
         frame2 = cv.undistort(frame2.copy(), K2, dist2)
 
         margin = int(0.01 * H_SIZE)   # crop 1% of width due to detection of outer square!
+        roi2 = frame2[margin:-margin, margin:-margin]
         
-        # static cam uses the same quad for consistency!
-        frame1[margin:-margin, margin:-margin]
-        dst_pts = np.array([[0,0], [H_SIZE,0], [H_SIZE,H_SIZE], [0,H_SIZE]]) 
-        H_outer1, _ = cv.findHomography(outer_quad1, dst_pts)
-        if H_outer1 is not None:
-            outer_warped1 = cv.warpPerspective(frame1, H_outer1, (H_SIZE, H_SIZE))
+        gray2 = cv.cvtColor(roi2.copy(), cv.COLOR_BGR2GRAY)
+        gray2 = cv.GaussianBlur(gray2, (5,5), 0) # smoother background
+        gray2 = cv.adaptiveThreshold(gray2, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, 11, 2)
+        outer_points2, inner_points2, fiducial_points2 = get_contours_separated(gray2)
+        if outer_points2 is None or inner_points2 is None or fiducial_points2 is None: continue
+        outer_points2 = outer_points2 + np.array([margin, margin], dtype=np.float32)
+        inner_points2 = outer_points2 + np.array([margin, margin], dtype=np.float32)
+        fiducial_points2 = outer_points2 + np.array([margin, margin], dtype=np.float32)
+        #H, _ = cv.findHomography(points1, points2)
+        
+        if H is None: continue
+        
+        #outer_warped2 = cv.warpPerspective(frame2, H, (H_SIZE, H_SIZE))
+        
+        # Visualization
+        vis_frame1 = frame1.copy()
+        cv.polylines(vis_frame1, [inner_points1.astype(int)], True, (0,0,255), 2)
+        cv.polylines(vis_frame1, [outer_points1.astype(int)], True, (0,0,255), 2)
+        cv.polylines(vis_frame1, [fiducial_points1.astype(int)], True, (0,0,255), 2)
+        vis_frame2 = frame2.copy()
+        cv.polylines(vis_frame2, [inner_points2.astype(int)], True, (0,0,255), 2)
+        cv.polylines(vis_frame2, [outer_points2.astype(int)], True, (0,0,255), 2)
+        cv.polylines(vis_frame2, [fiducial_points2.astype(int)], True, (0,0,255), 2)
+        cv.imshow(f"static frame outer", vis_frame1)
+        cv.imshow(f"moving frame outer", vis_frame2)
+        #cv.imshow(f"warped frame", outer_warped2)
+        keyp = cv.waitKey(0)
+        
+        
+        
+        # For saving the static camera frame, crop inner square from outer_warped
+        # xs = inner_quad_rot1[:, 0]
+        # ys = inner_quad_rot1[:, 1]
+
+        # x0 = int(np.min(xs))
+        # x1 = int(np.max(xs))
+        # y0 = int(np.min(ys))
+        # y1 = int(np.max(ys))
+
+        # # safety clamp
+        # x0 = max(0, x0)
+        # y0 = max(0, y0)
+        # x1 = min(outer_warped_rot1.shape[1], x1)
+        # y1 = min(outer_warped_rot1.shape[0], y1)
+
+        # saving_img = outer_warped_rot1[y0:y1, x0:x1]
+
+        # if saving_img.size == 0:
+        #     print("INVALID INNER SQUARE SIZE")
+        # else:
+        #     # Resize to canonical size
+        #     saving_img = cv.resize(saving_img, (INNER_SIZE, INNER_SIZE), interpolation=cv.INTER_AREA)
             
-            # moving cam search for lighting!
-            roi2 = frame2[margin:-margin, margin:-margin]
-            outer_quad2, outer_warped2, H_outer2, _ = detect_square(roi2)
-            if outer_quad2 is None or H_outer2 is None:
-                print("Failed moving outer square")
-                cv.imwrite(f"./analysis/moving_sqr_failed/frame_{frame_num:05d}.png", roi2)
-                mvn_sqr_fail_cnt += 1
-            else:
-                print("Detected moving outer square")
-                # Visualization
-                # vis_frame1 = frame1.copy()
-                # cv.polylines(vis_frame1, [outer_quad1.astype(int)], True, (0,0,255), 2)
-                # vis_frame2 = frame2.copy()
-                # cv.polylines(vis_frame2, [outer_quad2.astype(int)], True, (0,0,255), 2)
-                # cv.imshow(f"static_frame outer", vis_frame1)
-                # cv.imshow(f"moving_frame outer", vis_frame2)
-                # cv.waitKey(1)
+        #     # Visualization
+        #     cv.imshow(f"saving static image", saving_img)
+        #     keyp = cv.waitKey(1)
+            
+        #     # Convert to YUV
+        #     yuv = cv.cvtColor(saving_img, cv.COLOR_BGR2YUV)
+        #     Y, U, V = cv.split(yuv)
+        #     # Normalization
+        #     Y = Y.astype(np.float32) / 255.0    # l(x,y)
+        #     U = U.astype(np.float32) / 255.0
+        #     V = V.astype(np.float32) / 255.0
+            
+        #     # Light direction from moving camera
+        #     # r1, r2, r2 and t give camera orientation and position relative to the plane.
+        #     H_norm = np.linalg.inv(K2) @ H    # [r1,r2,t] = K^-1 • K[r1,r2,t]
+            
+        #     # R = H_norm[:,:2]
+        #     # T = H_norm[:,2]
+        #     # l = -R.T @ T
+        #     # u, v = l / np.linalg.norm(l)
+        #     # print(f"U: {u}, V: {v}, w: {np.sqrt(u**2+v**2)}")
+        #     #cv.waitKey(0)
+            
+        #     r1 = H_norm[:,0]
+        #     r2 = H_norm[:,1]
+        #     t = H_norm[:,2]
+        #     r1 /= np.linalg.norm(r1)
+        #     r2 /= np.linalg.norm(r2)
+        #     r3 = np.cross(r1, r2)
+        #     R_h = np.stack([r1, r2, r3], axis=1)  # This rotation maps plane coords -> camera coords
+            
+        #     # This vector points from the plane origin toward the camera
+        #     l_plane = -R_h.T @ t
+        #     l_norm = l_plane / np.linalg.norm(l_plane)
+            
+        #     # l_x, l_y, l_z
+        #     u, v, w = l_norm
+        #     # enforce the coords to be above surface
+        #     if w < 0: u, v, w = -u, -v, -w
+        #     print(f"U: {u}, V: {v}, w: {w}, SQRT(u*u+v*v): {np.sqrt(u*u+v*v)}")
+            
+        #     if u*u+v*v <= 1:
+        #         # Save
+        #         all_lights.append([u, v])
+        #         all_images.append(Y)
+        #         all_U.append(U)
+        #         all_V.append(V)
                 
-                #margin = int(0.01 * H_SIZE)   # crop 1.2%
-                # well.. this is only for visualization
-                # roi1 = outer_warped1[margin:-margin, margin:-margin]
-                # roi_inner_quad1, roi_inner_warped1, _, _ = detect_square(roi1, False)
-                # if roi_inner_quad1 is None: continue
-                #inner_quad1 = roi_inner_quad1 + np.array([margin, margin], dtype=np.float32) # back to org coords
-                
-                #roi2 = outer_warped2[margin:-margin, margin:-margin]
-                
-                # Visualization
-                vis_frame2 = outer_warped2.copy()
-                cv.polylines(vis_frame2, [inner_quad2.astype(int)], True, (0,0,255), 2)
-                cv.imshow(f"moving_frame inner", vis_frame2)
-                cv.waitKey(1)
-                
-                margin = int(0.02 * H_SIZE)   # crop
-                roi2 = outer_warped2[margin:-margin, margin:-margin]
-                center = np.mean(inner_quad1, axis=0)
-                scale = 1.07  # inflation factor 7%
-                roi_inner_quad2 = center + scale * (inner_quad2 - center)
-                
-                fid_x2, fid_y2, fid_r2 = detect_fiducial(roi2, roi_inner_quad2)
-                if (fid_x2 or fid_y2 or fid_r2) is None:
-                    print("Failed moving fiducial mark")
-                    cv.imwrite(f"./analysis/moving_fid_failed/frame_{frame_num:05d}.png", outer_warped2)
-                    mvn_fid_fail_cnt += 1
-                else:
-                    print("Detected fiducial mark")
-                    # fid_x2 += margin
-                    # fid_y2 += margin
-                    
-                    # Rotation by fiducial mark position
-                    outer_warped1, fid_rot1, R_f1 = set_frame_orientation(outer_warped1, (fid_x1, fid_y1), H_SIZE)
-                    outer_warped2, fid_rot2, R_f2 = set_frame_orientation(outer_warped2, (fid_x2, fid_y2), H_SIZE)
-                    
-                    # Visualization
-                    vis_frame1 = outer_warped1.copy()
-                    cv.polylines(vis_frame1, [inner_quad1.astype(int)], True, (0,0,255), 2)
-                    cv.circle(vis_frame1, (fid_x1, fid_y1), fid_r1, (0,255,0), 2)
-                    vis_frame2 = outer_warped2.copy()
-                    cv.polylines(vis_frame2, [inner_quad2.astype(int)], True, (0,0,255), 2)
-                    cv.circle(vis_frame2, (fid_x2, fid_y2), fid_r2, (0,255,0), 2)
-                    cv.imshow(f"static_frame fiducial", vis_frame1)
-                    cv.imshow(f"moving_frame fiducial", vis_frame2)
-                    cv.waitKey(1)
-                    
-                    # For saving the static camera frame, crop inner square from outer_warped
-                    xs = inner_quad1[:, 0]
-                    ys = inner_quad1[:, 1]
-
-                    x0 = int(np.min(xs))
-                    x1 = int(np.max(xs))
-                    y0 = int(np.min(ys))
-                    y1 = int(np.max(ys))
-
-                    # safety clamp
-                    x0 = max(0, x0)
-                    y0 = max(0, y0)
-                    x1 = min(outer_warped1.shape[1], x1)
-                    y1 = min(outer_warped1.shape[0], y1)
-
-                    saving_img = outer_warped1[y0:y1, x0:x1]
-
-                    if saving_img.size == 0:
-                        print("INVALID INNER SQUARE SIZE")
-                    else:
-                        # Resize to canonical size
-                        saving_img = cv.resize(saving_img, (INNER_SIZE, INNER_SIZE), interpolation=cv.INTER_AREA)
-                        
-                        # Visualization
-                        cv.imshow(f"saving static image", saving_img)
-                        cv.waitKey(1)
-                        
-                        # Convert to YUV
-                        yuv = cv.cvtColor(saving_img, cv.COLOR_BGR2YUV)
-                        Y, U, V = cv.split(yuv)
-                        # Normalization
-                        Y = Y.astype(np.float32) / 255.0    # l(x,y)
-                        U = U.astype(np.float32) / 255.0
-                        V = V.astype(np.float32) / 255.0
-                        
-                        # Now to get the light direction from moving camera
-                        H_mat = H_outer2                      # H = K[r1,r2,t]
-                        H_norm = np.linalg.inv(K2) @ H_mat    # [r1,r2,t]
-                        r1 = H_norm[:,0]
-                        r2 = H_norm[:,1]
-                        r1 /= np.linalg.norm(r1)
-                        r2 /= np.linalg.norm(r2)
-                        r3 = np.cross(r1, r2)
-                        R_h = np.stack([r1, r2, r3], axis=1)  # This rotation maps plane coords -> camera coords
-
-                        t = H_norm[:, 2]
-                        cam_pos_plane = -R_h.T @ t                # This vector points from the plane origin toward the camera
-                        l = cam_pos_plane / np.linalg.norm(cam_pos_plane)   # [u v w]
-
-                        # Apply fiducial-corrected rotation from a warped frame
-                        l_surface = R_f2.T @ l
-                        
-                        #print("Light direction (surface frame):", l_surface)
-                        
-                        u, v = l_surface[0], l_surface[1]
-
-                        # validity check (w = sqrt(1 - u^2 - v^2))
-                        if u*u + v*v > 1.0:
-                            print(f"INVALID: u*u + v*v = {u*u + v*v} > 1.0")
-                        else:
-                            # Save
-                            all_lights.append([u, v])
-                            all_images.append(Y)
-                            all_U.append(U)
-                            all_V.append(V)
+        #         # live plot
+        #         lights_np = np.array(all_lights)
+        #         sc.set_offsets(lights_np)
+        #         fig.canvas.draw_idle()
+        #         fig.canvas.flush_events()
                     
         if save_path is not None:
             cv.imwrite(f"{save_path}/frame_{frame_num:05d}.png", vis_frame1)
@@ -555,28 +561,31 @@ def main():
         frame_num += (SKIP_FRMS + 1)
         frame_cnt += 1
         
-        if cv.waitKey(1) == 113: break
+        keyp = cv.waitKey(1)
+        running = keyp != 113
 
-    print(f"MOVING SQUARE DETECTION FAIL COUNT: {mvn_sqr_fail_cnt}")
-    print(f"MOVING FIDUCIAL DETECTION FAIL COUNT: {mvn_fid_fail_cnt}")
-    
-    lights = np.array(all_lights, np.float32)           # (N, 2)
-    images = np.stack(all_images, axis=0)               # (N, H, W)
-    U_avg = np.mean(np.stack(all_U, axis=0), axis=0)    # (H, W)
-    V_avg = np.mean(np.stack(all_V, axis=0), axis=0)    # (H, W)
+    # lights = np.array(all_lights, np.float32)           # (N, 2)
+    # images = np.stack(all_images, axis=0)               # (N, H, W)
+    # U_avg = np.mean(np.stack(all_U, axis=0), axis=0)    # (H, W)
+    # V_avg = np.mean(np.stack(all_V, axis=0), axis=0)    # (H, W)
 
-    np.save("analysis/lights.npy", lights)
-    np.save("analysis/images.npy", images)
-    np.save("analysis/U_avg.npy", U_avg)
-    np.save("analysis/V_avg.npy", V_avg)
+    # np.save("analysis/lights.npy", lights)
+    # np.save("analysis/images.npy", images)
+    # np.save("analysis/U_avg.npy", U_avg)
+    # np.save("analysis/V_avg.npy", V_avg)
     
-    cv.destroyAllWindows()
-    analysis_vid1.release()
-    analysis_vid2.release()
+    # cv.destroyAllWindows()
+    # analysis_vid1.release()
+    # analysis_vid2.release()
     
-    plt.scatter(lights[:,0], lights[:,1])
-    plt.gca().set_aspect('equal')
-    plt.show()
+    # r = np.sqrt(lights[:,0]**2 + lights[:,1]**2)
+    # print("max radius:", r.max())
+    # print("min radius:", r.min())
+    
+    # plt.ioff()
+    # plt.scatter(lights[:,0], lights[:,1])
+    # plt.gca().set_aspect('equal')
+    # plt.show()
 
 
 if __name__ == "__main__":
