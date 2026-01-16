@@ -564,13 +564,13 @@ def main():
                     print(f"FID1: {fid_rot1.reshape(1, 2)}")
                     print(f"FID2: {fid_x2}, {fid_y2}; ROT_K: {rot_k2}")
                     
-                    if rot_k2 != 0:
-                    #     # shape (4,2), shape (1,2)
-                        src_pts = np.vstack([inner_quad2, (fid_x2, fid_y2)])
-                        dst_pts = np.vstack([inner_quad_rot1, fid_rot1.reshape(1, 2)])
-                        #src_pts, dst_pts, = inner_quad_rot2, inner_quad_rot1
-                        H_by_fid, _ = cv.findHomography(src_pts, dst_pts, cv.RANSAC, 3.0)
-                        outer_warped_rot2 = cv.warpPerspective(outer_warped2, H_by_fid, (H_SIZE, H_SIZE))
+                    #if rot_k2 != 0:
+                    # shape (4,2), shape (1,2)
+                    src_pts = np.vstack([inner_quad2, (fid_x2, fid_y2)])
+                    dst_pts = np.vstack([inner_quad_rot2, fid_rot2.reshape(1, 2)])
+                    #src_pts, dst_pts, = inner_quad_rot2, inner_quad_rot1
+                    H_by_fid, _ = cv.findHomography(src_pts, dst_pts, cv.RANSAC, 3.0)
+                    outer_warped_rot2 = cv.warpPerspective(outer_warped2, H_by_fid, (H_SIZE, H_SIZE))
                     if H_by_fid is None:
                         print("Failed homography with fid")
                         cv.imwrite(f"./analysis/homography_fid_failed/frame_{frame_num:05d}.png", roi2)
@@ -638,11 +638,9 @@ def main():
                             
                             # Light direction from moving camera
                             # r1, r2, r2 and t give camera orientation and position relative to the plane.
-                            # H_norm = np.linalg.inv(K2) @ (np.linalg.inv(H_by_fid) @ H_outer2)    # [r1,r2,t] = K^-1 • K[r1,r2,t]
-                            if rot_k2 == 0:
-                                H_norm = np.linalg.inv(K2) @ H_outer2
-                            else:
-                                H_norm = np.linalg.inv(K2) @ (H_by_fid @ H_outer2)
+                            #H_norm = np.linalg.inv(K2) @ (np.linalg.inv(H_by_fid) @ H_outer2)    # [r1,r2,t] = K^-1 • K[r1,r2,t]
+                            
+                            H_norm = np.linalg.inv(K2) @ (H_by_fid @ H_outer2)
                             
                             # R = H_norm[:,:2]
                             # T = H_norm[:,2]
